@@ -27,7 +27,7 @@ spec:
         - name: AZURE_CLIENT_SECRET
           valueFrom:
             secretKeyRef:
-              name: credentials
+              name: {{ template "fullname" . }}
               key: clientSecret
         - name: ACI_RESOURCE_GROUP
           value: {{ .Values.env.aciResourceGroup }}
