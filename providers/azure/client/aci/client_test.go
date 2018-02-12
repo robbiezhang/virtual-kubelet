@@ -71,11 +71,17 @@ func TestMain(m *testing.M) {
 }
 
 func TestNewClient(t *testing.T) {
-	var err error
-	client, err = NewClient(nil)
+	auth, err := azure.NewAuthenticationFromFile("../../../../credentials.json")
+        if err != nil {
+                log.Fatalf("Failed to load Azure authentication file: %v", err)
+        }
+
+	c, err := NewClient(auth)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	client = c
 }
 
 func TestCreateContainerGroupFails(t *testing.T) {
