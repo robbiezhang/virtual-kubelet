@@ -34,11 +34,11 @@ spec:
         - name: ACS_CREDENTIAL_LOCATION
           value: /etc/acs/azure.json
         - name: AZURE_TENANT_ID
-          value: {{ required "tenantId is required" .tenantId }}
+          value: {{ .tenantId }}
         - name: AZURE_SUBSCRIPTION_ID
-          value: {{ required "subscriptionId is required" .subscriptionId }}
+          value: {{ .subscriptionId }}
         - name: AZURE_CLIENT_ID
-          value: {{ required "clientId is required" .clientId }}
+          value: {{ .clientId }}
         - name: AZURE_CLIENT_SECRET
           valueFrom:
             secretKeyRef:
@@ -69,9 +69,9 @@ spec:
 {{- end }}
         command: ["virtual-kubelet"]
         args: [
-          "--provider", "{{ required "provider is required" .Values.provider }}",
+          "--provider", "{{ .Values.provider }}",
           "--namespace", "{{ .Values.monitoredNamespace }}",
-          "--nodename", "{{ required "nodeName is required" .Values.nodeName }}",
+          "--nodename", "{{ .Values.nodeName }}",
           "--os", "{{ .Values.nodeOsType }}",
           "--taint", "{{ .Values.nodeTaint }}"
         ]
