@@ -4,7 +4,7 @@ image:
   pullPolicy: Always
 
 ## `provider` should be one of aws, azure, azurebatch, etc...
-provider: 
+provider: "azure" 
 nodeName: "virtual-kubelet"
 nodeTaint: "azure.com/aci"
 nodeOsType: "Linux"
