@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -223,48 +224,49 @@ func (s *Server) Run() error {
 			FieldSelector: fields.OneTermEqualSelector("spec.nodeName", s.nodeName).String(),
 		}
 
-		pods, err := s.k8sClient.CoreV1().Pods(s.namespace).List(opts)
-		if err != nil {
-			log.Fatal("Failed to list pods", err)
-		}
-		s.resourceManager.SetPods(pods)
-		s.reconcile()
+		var controller cache.Controller
+		_, controller = cache.NewInformer(
 
-		opts.ResourceVersion = pods.ResourceVersion
-		s.podWatcher, err = s.k8sClient.CoreV1().Pods(s.namespace).Watch(opts)
-		if err != nil {
-			log.Fatal("Failed to watch pods", err)
-		}
+			&cache.ListWatch{
 
-		loop:
-		for {
-			select {
-			case ev, ok := <-s.podWatcher.ResultChan():
-				if !ok {
-					if shouldStop {
-						log.Println("Pod watcher is stopped.")
-						return nil
-					}
+				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+					return sa.k8sClient.Core().Pods(s.namespace).List(opts)
+				},
 
-					log.Println("Pod watcher connection is closed unexpectedly.")
-					break loop
-				}
+				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+					return sa.k8sClient.Core().Pods(s.namespace).Watch(opts)
+				},
+			},
 
-				log.Println("Pod watcher event is received:", ev.Type)
-				switch ev.Type {
-				case watch.Added:
-					s.resourceManager.AddPod(ev.Object.(*corev1.Pod))
-				case watch.Modified:
-					s.resourceManager.UpdatePod(ev.Object.(*corev1.Pod))
-				case watch.Deleted:
-					s.resourceManager.DeletePod(ev.Object.(*corev1.Pod))
-				}
-				s.reconcile()
-			}
-		}
+			&k8sV1.Pod{},
 
-		time.Sleep(5 * time.Second)
+			1*time.Minute,
+
+			cache.ResourceEventHandlerFuncs{
+				AddFunc:    s.onAddPod,
+				UpdateFunc: s.onUpdatePod,
+				DeleteFunc: s.onDeletePod,
+			},
+		)
 	}
+}
+
+func (s *Server) onAddPod(obj interface{}) {
+	s.resourceManager.AddPod(obj.(*k8sV1.Pod))
+
+	s.reconcile()
+}
+
+func (s *Server) onUpdatePod(old, new interface{}) {
+	s.resourceManager.UpdatePod(new.(*k8sV1.Pod))
+
+	s.reconcile()
+}
+
+func (s *Server) onDeletePod(obj interface{}) {
+	s.resourceManager.DeletePod(obj.(*corev1.Pod))
+
+	s.reconcile()
 }
 
 // Stop shutsdown the server.
