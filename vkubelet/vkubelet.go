@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -42,8 +43,8 @@ type Server struct {
 	k8sClient       *kubernetes.Clientset
 	taint           string
 	provider        Provider
-	podWatcher      watch.Interface
 	resourceManager *manager.ResourceManager
+	stopCh		chan struct{}
 }
 
 // New creates a new virtual-kubelet server.
@@ -209,72 +210,85 @@ func (s *Server) registerNode() error {
 // Run starts the server, registers it with Kubernetes and begins watching/reconciling the cluster.
 // Run will block until Stop is called or a SIGINT or SIGTERM signal is received.
 func (s *Server) Run() error {
-	shouldStop := false
-
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
-		shouldStop = true
 		s.Stop()
 	}()
 
+	opts := metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", s.nodeName).String(),
+	}
+
+	var controller cache.Controller
+	_, controller = cache.NewInformer(
+
+		&cache.ListWatch{
+
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				return s.k8sClient.Core().Pods(s.namespace).List(opts)
+			},
+
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				return s.k8sClient.Core().Pods(s.namespace).Watch(opts)
+			},
+		},
+
+		&corev1.Pod{},
+
+		1*time.Minute,
+
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    s.onAddPod,
+			UpdateFunc: s.onUpdatePod,
+			DeleteFunc: s.onDeletePod,
+		},
+	)
+
 	for {
-		opts := metav1.ListOptions{
-			FieldSelector: fields.OneTermEqualSelector("spec.nodeName", s.nodeName).String(),
-		}
+		controller.Run(s.stopCh)
 
-		var controller cache.Controller
-		_, controller = cache.NewInformer(
+		log.Println("Cache controller exits unexpected. Re-connect in 5 seconds.")
 
-			&cache.ListWatch{
-
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					return sa.k8sClient.Core().Pods(s.namespace).List(opts)
-				},
-
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					return sa.k8sClient.Core().Pods(s.namespace).Watch(opts)
-				},
-			},
-
-			&k8sV1.Pod{},
-
-			1*time.Minute,
-
-			cache.ResourceEventHandlerFuncs{
-				AddFunc:    s.onAddPod,
-				UpdateFunc: s.onUpdatePod,
-				DeleteFunc: s.onDeletePod,
-			},
-		)
+		time.Sleep(5 * time.Second)
 	}
 }
 
 func (s *Server) onAddPod(obj interface{}) {
-	s.resourceManager.AddPod(obj.(*k8sV1.Pod))
+	pod := obj.(*corev1.Pod)
 
-	s.reconcile()
+	log.Printf("ADD pod: %s/%s", pod.Namespace, pod.Name)
+
+	if r := s.resourceManager.AddPod(pod); r {
+		s.reconcile()
+	}
 }
 
 func (s *Server) onUpdatePod(old, new interface{}) {
-	s.resourceManager.UpdatePod(new.(*k8sV1.Pod))
+	pod := new.(*corev1.Pod)
 
-	s.reconcile()
+	log.Printf("UPDATE pod: %s/%s", pod.Namespace, pod.Name)
+
+	if r := s.resourceManager.UpdatePod(pod); r {
+		s.reconcile()
+	}
 }
 
 func (s *Server) onDeletePod(obj interface{}) {
-	s.resourceManager.DeletePod(obj.(*corev1.Pod))
+        pod := obj.(*corev1.Pod)
 
-	s.reconcile()
+	log.Printf("DELETE pod: %s/%s", pod.Namespace, pod.Name)
+
+	if r := s.resourceManager.DeletePod(pod); r {
+		s.reconcile()
+	}
 }
 
 // Stop shutsdown the server.
 // It does not shutdown pods assigned to the virtual node.
 func (s *Server) Stop() {
-	if s.podWatcher != nil {
-		s.podWatcher.Stop()
-	}
+	s.stopCh <- struct{}{}
 }
 
 // updateNode updates the node status within Kubernetes with updated NodeConditions.
@@ -312,15 +326,18 @@ func (s *Server) updateNode() {
 // reconcile is the main reconciliation loop that compares differences between Kubernetes and
 // the active provider and reconciles the differences.
 func (s *Server) reconcile() {
+	log.Println("Start reconcile.")
 	providerPods, err := s.provider.GetPods()
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
+	log.Println("Delete pods that don't exist in Kubernetes")
 	for _, pod := range providerPods {
 		// Delete pods that don't exist in Kubernetes
 		if p := s.resourceManager.GetPod(pod.Namespace, pod.Name); p == nil {
+			log.Printf("Deleting pod '%s'\n", pod.Name)
 			if err := s.deletePod(pod); err != nil {
 				log.Printf("Error deleting pod '%s': %s\n", pod.Name, err)
 				continue
@@ -328,6 +345,7 @@ func (s *Server) reconcile() {
 		}
 	}
 
+	log.Println("Create any pods for k8s pods that don't exist in the provider")
 	// Create any pods for k8s pods that don't exist in the provider
 	pods := s.resourceManager.GetPods()
 	for _, pod := range pods {
@@ -337,6 +355,7 @@ func (s *Server) reconcile() {
 		}
 
 		if pod.DeletionTimestamp == nil && pod.Status.Phase != corev1.PodFailed && p == nil {
+			log.Printf("Creating pod '%s'\n", pod.Name)
 			if err := s.createPod(pod); err != nil {
 				log.Printf("Error creating pod '%s': %s\n", pod.Name, err)
 				continue
@@ -344,8 +363,9 @@ func (s *Server) reconcile() {
 			log.Printf("Pod '%s' created.\n", pod.Name)
 		}
 
-		// Delete pod if DeletionTimestamp set
+		// Delete pod if DeletionTimestamp is set
 		if pod.DeletionTimestamp != nil {
+			log.Printf("Pod '%s' is pending deletion.\n", pod.Name)
 			var err error
 			if err = s.deletePod(pod); err != nil {
 				log.Printf("Error deleting pod '%s': %s\n", pod.Name, err)
@@ -380,22 +400,20 @@ func (s *Server) createPod(pod *corev1.Pod) error {
 
 func (s *Server) deletePod(pod *corev1.Pod) error {
 	var delErr error
-	if delErr = s.provider.DeletePod(pod); delErr != nil && errors.IsNotFound(delErr) {
-		return fmt.Errorf("Error deleting pod '%s': %s", pod.Name, delErr)
+	if delErr = s.provider.DeletePod(pod); delErr != nil {
+		return delErr
 	}
 
-	if !errors.IsNotFound(delErr) {
-		var grace int64
-		if err := s.k8sClient.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil && errors.IsNotFound(err) {
-			if errors.IsNotFound(err) {
-				return nil
-			}
-
-			return fmt.Errorf("Failed to delete kubernetes pod: %s", err)
+	var grace int64 = 0
+	if err := s.k8sClient.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil && errors.IsNotFound(err) {
+		if errors.IsNotFound(err) {
+			return nil
 		}
 
-		log.Printf("Pod '%s' deleted.\n", pod.Name)
+		return err
 	}
+
+	log.Printf("Pod '%s' deleted.\n", pod.Name)
 
 	return nil
 }

@@ -69,73 +69,75 @@ func NewResourceManager(k8sClient kubernetes.Interface) *ResourceManager {
 	return &rm
 }
 
-// SetPods clears the internal cache and populates it with the supplied pods.
-func (rm *ResourceManager) SetPods(pods *v1.PodList) {
-	rm.Lock()
-	defer rm.Unlock()
-
-	rm.pods = make(map[string]*v1.Pod, len(pods.Items))
-	rm.configMapRef = make(map[string]int64, 0)
-	rm.secretRef = make(map[string]int64, 0)
-	rm.configMaps = make(map[string]*v1.ConfigMap, len(pods.Items))
-	rm.secrets = make(map[string]*v1.Secret, len(pods.Items))
-
-	for k, p := range pods.Items {
-		if p.Status.Phase == v1.PodSucceeded {
-			continue
-		}
-		rm.pods[rm.getStoreKey(p.Namespace, p.Name)] = &pods.Items[k]
-
-		rm.incrementRefCounters(&p)
-	}
-}
-
 // AddPod adds a pod to the internal cache.
-func (rm *ResourceManager) AddPod(p *v1.Pod) {
+func (rm *ResourceManager) AddPod(p *v1.Pod) bool {
 	rm.Lock()
 	defer rm.Unlock()
-	if p.Status.Phase == v1.PodSucceeded {
-		return
+	podKey := rm.getStoreKey(p.Namespace, p.Name)
+	if p.Status.Phase == v1.PodSucceeded && p.DeletionTimestamp == nil {
+		// NOTE(robbiezhang): reconcile if the pod is in resource manager cache.
+		_, ok := rm.pods[podKey]
+		return ok
 	}
 
-	podKey := rm.getStoreKey(p.Namespace, p.Name)
 	if _, ok := rm.pods[podKey]; ok {
 		rm.UpdatePod(p)
-		return
+		return false
 	}
 
 	rm.pods[podKey] = p
 	rm.incrementRefCounters(p)
+	return true
 }
 
 // UpdatePod updates the supplied pod in the cache.
-func (rm *ResourceManager) UpdatePod(p *v1.Pod) {
+func (rm *ResourceManager) UpdatePod(p *v1.Pod) bool {
 	rm.Lock()
 	defer rm.Unlock()
 
 	podKey := rm.getStoreKey(p.Namespace, p.Name)
-	if p.Status.Phase == v1.PodSucceeded {
-		delete(rm.pods, podKey)
-	}
-
 	if old, ok := rm.pods[podKey]; ok {
 		rm.decrementRefCounters(old)
+
+		if p.Status.Phase == v1.PodSucceeded && p.DeletionTimestamp == nil {
+			log.Printf("Pod succeeded '%s'. Remove from cache", p.Name)
+			delete(rm.pods, podKey)
+			return false
+		}
+
+		rm.pods[podKey] = p
+	        rm.incrementRefCounters(p)
+
+		if p.DeletionTimestamp != nil {
+			return true
+		}
+
+		return false
 	}
-	rm.incrementRefCounters(p)
+
+	if p.Status.Phase == v1.PodSucceeded && p.DeletionTimestamp == nil {
+		return false
+	}
 
 	rm.pods[podKey] = p
+	rm.incrementRefCounters(p)
+	return true
 }
 
 // DeletePod removes the pod from the cache.
-func (rm *ResourceManager) DeletePod(p *v1.Pod) {
+func (rm *ResourceManager) DeletePod(p *v1.Pod) bool {
 	rm.Lock()
 	defer rm.Unlock()
 
 	podKey := rm.getStoreKey(p.Namespace, p.Name)
 	if old, ok := rm.pods[podKey]; ok {
 		rm.decrementRefCounters(old)
+		log.Printf("Pod deleted '%s'. Remove from cache", p.Name)
 		delete(rm.pods, podKey)
+		return true
 	}
+
+	return false
 }
 
 // GetPod retrieves the specified pod from the cache. It returns nil if a pod is not found.
