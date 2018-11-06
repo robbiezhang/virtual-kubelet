@@ -7,9 +7,10 @@ import (
 
 	pkgerrors "github.com/pkg/errors"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
+	"github.com/virtual-kubelet/virtual-kubelet/providers/errors"
 	"go.opencensus.io/trace"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -146,16 +147,27 @@ func (s *Server) syncPod(ctx context.Context, pod *corev1.Pod) {
 		logger.Debugf("Deleting pod")
 		if err := s.deletePod(ctx, pod); err != nil {
 			logger.WithError(err).Error("Failed to delete pod")
-			time.AfterFunc(5*time.Second, func() {
-				s.podCh <- &podNotification{pod: pod, ctx: ctx}
-			})
+			s.retryPodOperationIfNeeded(ctx, pod, err)
 		}
 	} else {
 		span.Annotate(nil, "Create pod")
 		logger.Debugf("Creating pod")
 		if err := s.createPod(ctx, pod); err != nil {
 			logger.WithError(err).Errorf("Failed to create pod")
+			s.retryPodOperationIfNeeded(ctx, pod, err)
 		}
+	}
+}
+
+func (s *Server) retryPodOperationIfNeeded(ctx context.Context, pod *corev1.Pod, err error) {
+	if errors.IsRetryable(err) {
+		delay, exists := errors.SuggestsClientDelay(err)
+		if !exists {
+			delay = 5
+		}
+		time.AfterFunc(time.Duration(delay)*time.Second, func() {
+			s.podCh <- &podNotification{pod: pod, ctx: ctx}
+		})
 	}
 }
 
@@ -204,17 +216,16 @@ func (s *Server) deletePod(ctx context.Context, pod *corev1.Pod) error {
 	defer span.End()
 	addPodAttributes(span, pod)
 
-	var delErr error
-	if delErr = s.provider.DeletePod(ctx, pod); delErr != nil && !errors.IsNotFound(delErr) {
-		span.SetStatus(trace.Status{Code: trace.StatusCodeUnknown, Message: delErr.Error()})
-		return delErr
+	if origErr := s.provider.DeletePod(ctx, pod); origErr != nil && !errors.IsNotFound(origErr) {
+		span.SetStatus(trace.Status{Code: trace.StatusCodeUnknown, Message: origErr.Error()})
+		return origErr
 	}
 	span.Annotate(nil, "Deleted pod from provider")
 
 	logger := log.G(ctx).WithField("pod", pod.GetName()).WithField("namespace", pod.GetNamespace())
 	var grace int64
 	if err := s.k8sClient.CoreV1().Pods(pod.GetNamespace()).Delete(pod.GetName(), &metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil && errors.IsNotFound(err) {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			span.Annotate(nil, "Pod does not exist in k8s, nothing to delete")
 			return nil
 		}

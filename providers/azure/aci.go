@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,9 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/manager"
 	client "github.com/virtual-kubelet/virtual-kubelet/providers/azure/client"
 	"github.com/virtual-kubelet/virtual-kubelet/providers/azure/client/aci"
+	"github.com/virtual-kubelet/virtual-kubelet/providers/azure/client/api"
 	"github.com/virtual-kubelet/virtual-kubelet/providers/azure/client/network"
+	providererr "github.com/virtual-kubelet/virtual-kubelet/providers/errors"
 	"go.opencensus.io/trace"
 	"k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
@@ -52,6 +55,12 @@ const (
 	maxDNSNameservers     = 3
 	maxDNSSearchPaths     = 6
 	maxDNSSearchListChars = 256
+)
+
+// Retry error settings
+const (
+	retryAfterHeader         = "Retry-After"
+	defaultRetryAfterSeconds = 5
 )
 
 // ACIProvider implements the virtual-kubelet provider interface and communicates with Azure's ACI APIs.
@@ -563,7 +572,11 @@ func (p *ACIProvider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 		containerGroup,
 	)
 
-	return err
+	if err != nil {
+		return toProviderError(ctx, err)
+	}
+
+	return nil
 }
 
 func (p *ACIProvider) amendVnetResources(containerGroup *aci.ContainerGroup, pod *v1.Pod) {
@@ -691,7 +704,11 @@ func (p *ACIProvider) DeletePod(ctx context.Context, pod *v1.Pod) error {
 	defer span.End()
 	addAzureAttributes(span, p)
 
-	return p.aciClient.DeleteContainerGroup(ctx, p.resourceGroup, fmt.Sprintf("%s-%s", pod.Namespace, pod.Name))
+	if err := p.aciClient.DeleteContainerGroup(ctx, p.resourceGroup, fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)); err != nil {
+		return toProviderError(ctx, err)
+	}
+
+	return nil
 }
 
 // GetPod returns a pod by name that is running inside ACI
@@ -706,7 +723,7 @@ func (p *ACIProvider) GetPod(ctx context.Context, namespace, name string) (*v1.P
 		if status != nil && *status == http.StatusNotFound {
 			return nil, nil
 		}
-		return nil, err
+		return nil, toProviderError(ctx, err)
 	}
 
 	if cg.Tags["NodeName"] != p.nodeName {
@@ -725,7 +742,7 @@ func (p *ACIProvider) GetContainerLogs(ctx context.Context, namespace, podName, 
 	logContent := ""
 	cg, err, _ := p.aciClient.GetContainerGroup(ctx, p.resourceGroup, fmt.Sprintf("%s-%s", namespace, podName))
 	if err != nil {
-		return logContent, err
+		return logContent, toProviderErrorWithMessage(ctx, fmt.Sprintf("Unable to find container group '%s-%s'", namespace, podName), err)
 	}
 
 	if cg.Tags["NodeName"] != p.nodeName {
@@ -734,18 +751,24 @@ func (p *ACIProvider) GetContainerLogs(ctx context.Context, namespace, podName, 
 	// get logs from cg
 	retry := 10
 	var retries int
+	var logErr error
 	for retries = 0; retries < retry; retries++ {
 		cLogs, err := p.aciClient.GetContainerLogs(ctx, p.resourceGroup, cg.Name, containerName, tail)
 		if err != nil {
+			logErr = err
 			log.G(ctx).WithField("method", "GetContainerLogs").WithError(err).Debug("Error getting container logs, retrying")
 			span.Annotate(nil, "Error getting container logs, retrying")
 			time.Sleep(5000 * time.Millisecond)
 		} else {
-			logContent = cLogs.Content
-			break
+			return cLogs.Content, nil
 		}
 	}
-	return logContent, err
+
+	if logErr != nil {
+		return logContent, toProviderError(ctx, err)
+	}
+
+	return logContent, nil
 }
 
 // GetPodFullName as defined in the provider context
@@ -764,9 +787,11 @@ func (p *ACIProvider) ExecInContainer(name string, uid types.UID, container stri
 		defer errstream.Close()
 	}
 
-	cg, err, _ := p.aciClient.GetContainerGroup(context.TODO(), p.resourceGroup, name)
+	ctx := context.TODO()
+
+	cg, err, _ := p.aciClient.GetContainerGroup(ctx, p.resourceGroup, name)
 	if err != nil {
-		return err
+		return toProviderErrorWithMessage(ctx, fmt.Sprintf("Unable to find container group '%s'", name), err)
 	}
 
 	// Set default terminal size
@@ -781,7 +806,7 @@ func (p *ACIProvider) ExecInContainer(name string, uid types.UID, container stri
 
 	xcrsp, err := p.aciClient.LaunchExec(p.resourceGroup, cg.Name, container, cmd[0], terminalSize)
 	if err != nil {
-		return err
+		return toProviderError(ctx, err)
 	}
 
 	wsUri := xcrsp.WebSocketUri
@@ -857,7 +882,7 @@ func (p *ACIProvider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
 
 	cgs, err := p.aciClient.ListContainerGroups(ctx, p.resourceGroup)
 	if err != nil {
-		return nil, err
+		return nil, toProviderError(ctx, err)
 	}
 	pods := make([]*v1.Pod, 0, len(cgs.Value))
 
@@ -869,7 +894,7 @@ func (p *ACIProvider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
 
 		p, err := containerGroupToPod(&c)
 		if err != nil {
-			log.G(context.TODO()).WithFields(logrus.Fields{
+			log.G(ctx).WithFields(logrus.Fields{
 				"name": c.Name,
 				"id":   c.ID,
 			}).WithError(err).Error("error converting container group to pod")
@@ -1556,4 +1581,67 @@ func getACIEnvVar(e v1.EnvVar) aci.EnvironmentVariable {
 		}
 	}
 	return envVar
+}
+
+func toProviderError(ctx context.Context, err error) error {
+	return toProviderErrorWithMessage(ctx, "", err)
+}
+
+func toProviderErrorWithMessage(ctx context.Context, message string, err error) error {
+	ctx, span := trace.StartSpan(ctx, "aci.toProviderError")
+	defer span.End()
+
+	if apiErr, ok := err.(*api.Error); ok {
+		if message == "" {
+			message = apiErr.Message
+		}
+
+		switch apiErr.StatusCode{
+		case http.StatusBadRequest:
+			return providererr.NewBadRequest(message, err)
+		case http.StatusUnauthorized:
+		case http.StatusForbidden:
+			return providererr.NewUnauthorized(message, err)
+		case http.StatusNotFound:
+			return providererr.NewNotFound(message, err)
+		case http.StatusTooManyRequests:
+			retryAfterSeconds := getRetryAfter(ctx, apiErr.Header)
+			return providererr.NewTooManyRequests(message, retryAfterSeconds, err)
+		case http.StatusInternalServerError:
+			retryAfterSeconds := getRetryAfter(ctx, apiErr.Header)
+			return providererr.NewInternalServerError(message, retryAfterSeconds, err)
+		case http.StatusServiceUnavailable:
+			retryAfterSeconds := getRetryAfter(ctx, apiErr.Header)
+			return providererr.NewServiceUnavailable(message, retryAfterSeconds, err)
+		default:
+			return providererr.NewUnknownError(message, err)
+		}
+	}
+
+	return providererr.NewUnknownError(message, err)
+}
+
+func getRetryAfter(ctx context.Context, header http.Header) int {
+	ctx, span := trace.StartSpan(ctx, "aci.getRetryAfter")
+	defer span.End()
+	logger := log.G(ctx).WithField("method", "getRetryAfter")
+
+	if header == nil {
+		logger.Debugf("Header is not set. Use the default value: %d", defaultRetryAfterSeconds)
+		return defaultRetryAfterSeconds
+	}
+
+	retryAfterStr := header.Get("Retry-After")
+	if retryAfterStr == "" {
+		logger.Debugf("Retry-After header is not set. Use the default value: %d", defaultRetryAfterSeconds)
+		return defaultRetryAfterSeconds
+	}
+
+	retryAfter, err := strconv.Atoi(retryAfterStr)
+	if err != nil {
+		logger.Debugf("Failed to parse Retry-After header '%s'. Error: %s. Use the default value: %d", retryAfterStr, err.Error(), defaultRetryAfterSeconds)
+		return defaultRetryAfterSeconds
+	}
+
+	return retryAfter
 }

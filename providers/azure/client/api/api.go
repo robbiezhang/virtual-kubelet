@@ -47,21 +47,30 @@ func CheckResponse(res *http.Response) error {
 		return nil
 	}
 	slurp, err := ioutil.ReadAll(res.Body)
-	if err == nil {
-		jerr := new(errorReply)
-		err = json.Unmarshal(slurp, jerr)
-		if err == nil && jerr.Error != nil {
-			if jerr.Error.StatusCode == 0 {
-				jerr.Error.StatusCode = res.StatusCode
-			}
-			jerr.Error.Body = string(slurp)
-			jerr.Error.URL = res.Request.URL.String()
-			return jerr.Error
+	if err != nil {
+		return &Error{
+			StatusCode: res.StatusCode,
+			Message:    res.Status,
+			Header:     res.Header,
 		}
 	}
+
+	body := string(slurp)
+	jerr := new(errorReply)
+	err = json.Unmarshal(slurp, jerr)
+	if err == nil && jerr.Error != nil {
+		if jerr.Error.StatusCode == 0 {
+			jerr.Error.StatusCode = res.StatusCode
+		}
+		jerr.Error.Body = body
+		jerr.Error.URL = res.Request.URL.String()
+		return jerr.Error
+	}
+
 	return &Error{
 		StatusCode: res.StatusCode,
-		Body:       string(slurp),
+		Message:    body,
+		Body:       body,
 		Header:     res.Header,
 	}
 }
