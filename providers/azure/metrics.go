@@ -134,6 +134,7 @@ func collectMetrics(pod *v1.Pod, system, net *aci.ContainerGroupMetricsResult) s
 	var stat stats.PodStats
 	containerStats := make(map[string]*stats.ContainerStats, len(pod.Status.ContainerStatuses))
 	stat.StartTime = pod.CreationTimestamp
+	now := metav1.NewTime(time.Now())
 
 	for _, m := range system.Value {
 		// cpu/mem stats are per container, so each entry in the time series is for a container, not the container group.
@@ -170,13 +171,13 @@ func collectMetrics(pod *v1.Pod, system, net *aci.ContainerGroupMetricsResult) s
 				// average is the average number of millicores over a 1 minute interval (which is the interval we are pulling the stats for)
 				nanoCores := uint64(data.Average * 1000000)
 				usageNanoSeconds := nanoCores * 60
-				cs.CPU.Time = metav1.NewTime(data.Timestamp)
+				cs.CPU.Time = now
 				cs.CPU.UsageCoreNanoSeconds = &usageNanoSeconds
 				cs.CPU.UsageNanoCores = &nanoCores
 
 				if stat.CPU == nil {
 					var zero uint64
-					stat.CPU = &stats.CPUStats{UsageNanoCores: &zero, UsageCoreNanoSeconds: &zero, Time: metav1.NewTime(data.Timestamp)}
+					stat.CPU = &stats.CPUStats{UsageNanoCores: &zero, UsageCoreNanoSeconds: &zero, Time: now}
 				}
 				podCPUSec := *stat.CPU.UsageCoreNanoSeconds
 				podCPUSec += usageNanoSeconds
@@ -189,14 +190,14 @@ func collectMetrics(pod *v1.Pod, system, net *aci.ContainerGroupMetricsResult) s
 				if cs.Memory == nil {
 					cs.Memory = &stats.MemoryStats{}
 				}
-				cs.Memory.Time = metav1.NewTime(data.Timestamp)
+				cs.Memory.Time = now
 				bytes := uint64(data.Average)
 				cs.Memory.UsageBytes = &bytes
 				cs.Memory.WorkingSetBytes = &bytes
 
 				if stat.Memory == nil {
 					var zero uint64
-					stat.Memory = &stats.MemoryStats{UsageBytes: &zero, WorkingSetBytes: &zero, Time: metav1.NewTime(data.Timestamp)}
+					stat.Memory = &stats.MemoryStats{UsageBytes: &zero, WorkingSetBytes: &zero, Time: now}
 				}
 				podMem := *stat.Memory.UsageBytes
 				podMem += bytes
@@ -227,7 +228,7 @@ func collectMetrics(pod *v1.Pod, system, net *aci.ContainerGroupMetricsResult) s
 		case aci.MetricTyperNetworkBytesTransmittedPerSecond:
 			stat.Network.TxBytes = &bytes
 		}
-		stat.Network.Time = metav1.NewTime(data.Timestamp)
+		stat.Network.Time = now
 		stat.Network.InterfaceStats.Name = "eth0"
 	}
 
